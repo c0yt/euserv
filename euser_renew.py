@@ -1088,41 +1088,135 @@ def send_bark(title: str, content: str, config: GlobalConfig):
 
 
 
-def send_telegram(message: str, config: GlobalConfig):
-    """发送 Telegram 通知"""
+def send_telegram(message: str, config: GlobalConfig, photo_path: str = None):
+    """发送 Telegram 通知（支持图片）"""
     if not config.telegram_bot_token or not config.telegram_chat_id:
         logger.warning("⚠️ 未配置 Telegram，跳过通知")
         return
-    
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
-    data = {
-        "chat_id": config.telegram_chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    
+
     try:
-        response = requests.post(url, json=data, timeout=10)
-        if response.status_code == 200:
-            logger.info("✅ Telegram 通知发送成功")
+        # 如果有图片，发送图片消息
+        if photo_path and os.path.exists(photo_path):
+            url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendPhoto"
+            with open(photo_path, 'rb') as f:
+                files = {'photo': f}
+                data = {
+                    'chat_id': config.telegram_chat_id,
+                    'caption': message,
+                    'parse_mode': 'HTML'
+                }
+                response = requests.post(url, data=data, files=files, timeout=30)
+
+            if response.status_code == 200:
+                logger.info("✅ Telegram 图片通知发送成功")
+            else:
+                logger.error(f"❌ Telegram 图片通知失败: {response.status_code}")
+                # 图片发送失败，尝试纯文本
+                send_telegram(message, config, photo_path=None)
         else:
-            logger.error(f"❌ Telegram 通知失败: {response.status_code}")
+            # 纯文本消息
+            url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+            data = {
+                "chat_id": config.telegram_chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            response = requests.post(url, json=data, timeout=10)
+
+            if response.status_code == 200:
+                logger.info("✅ Telegram 通知发送成功")
+            else:
+                logger.error(f"❌ Telegram 通知失败: {response.status_code}")
     except Exception as e:
         logger.error(f"❌ Telegram 异常: {e}", exc_info=True)
 
 
-def send_notification(title: str, message: str, config: GlobalConfig):
+def build_notification_message(account_email: str, servers: dict, renew_results: list,
+                               error_msg: str = None) -> str:
     """
-    统一发送通知（支持 Telegram 和 Bark）
-    
+    构建通知消息（模仿 g4f 样式）
+
+    Args:
+        account_email: 账号邮箱
+        servers: 服务器字典
+        renew_results: 续期结果列表
+        error_msg: 错误信息
+
+    Returns:
+        格式化的通知消息
+    """
+    lines = []
+    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 判断是否有续期操作
+    has_renew = len(renew_results) > 0
+    all_success = all(r['success'] for r in renew_results) if has_renew else False
+
+    # 标题
+    if error_msg:
+        lines.append("❌ 续期失败")
+    elif has_renew and all_success:
+        lines.append("✅ 续期成功")
+    elif has_renew and not all_success:
+        lines.append("⚠️ 部分成功")
+    else:
+        lines.append("ℹ️ 无需续期")
+
+    lines.append("")
+
+    # 账号信息
+    lines.append(f"<b>账号</b>: {account_email}")
+    lines.append(f"<b>时间</b>: {time_str}")
+    lines.append("")
+
+    # 服务器信息
+    if servers:
+        lines.append(f"<b>服务器数量</b>: {len(servers)}")
+        for order_id, (can_renew, can_renew_date) in servers.items():
+            if can_renew_date:
+                from datetime import datetime as dt
+                try:
+                    expiry_date = dt.strptime(can_renew_date, "%Y-%m-%d")
+                    remaining_days = (expiry_date - dt.now()).days
+                    lines.append(f"  • 订单 {order_id}")
+                    lines.append(f"    到期: {can_renew_date}")
+                    lines.append(f"    剩余: {remaining_days} 天")
+                except:
+                    lines.append(f"  • 订单 {order_id}: {can_renew_date}")
+
+    # 续期结果
+    if renew_results:
+        lines.append("")
+        lines.append("<b>续期操作</b>:")
+        for r in renew_results:
+            status = "✅" if r['success'] else "❌"
+            lines.append(f"  {status} 订单 {r['order_id']}")
+
+    # 错误信息
+    if error_msg:
+        lines.append("")
+        lines.append(f"<b>错误</b>: {error_msg}")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━")
+    lines.append("🤖 EUserv Auto Renew")
+
+    return "\n".join(lines)
+
+
+def send_notification(title: str, message: str, config: GlobalConfig, photo_path: str = None):
+    """
+    统一发送通知（支持 Telegram 和 Bark，支持图片）
+
     Args:
         title: 通知标题（主要用于 Bark）
         message: 通知内容
         config: 全局配置对象
+        photo_path: 截图路径（可选）
     """
-    # 发送 Telegram 通知
-    send_telegram(message, config)
-    
+    # 发送 Telegram 通知（支持图片）
+    send_telegram(message, config, photo_path)
+
     # 发送 Bark 通知（将 HTML 格式转为纯文本）
     plain_message = re.sub(r'<[^>]+>', '', message)  # 移除 HTML 标签
     send_bark(title, plain_message, config)
@@ -1299,9 +1393,28 @@ def main():
 
     # 只有存在需要通知的事件时才发送
     if notify_parts:
+        # 使用旧的通知方式（保持兼容）
         header = f"<b>🔄 EUserv 续期通知</b>\n时间: {time_str}\n"
         message = header + "\n\n".join(notify_parts)
         send_notification("EUserv 续期通知", message, GLOBAL_CONFIG)
+
+        # 同时使用新样式通知（如果有续期操作）
+        for result in all_results:
+            if result.get('success') and result.get('renew_results'):
+                new_message = build_notification_message(
+                    account_email=result['email'],
+                    servers=result.get('servers', {}),
+                    renew_results=result.get('renew_results', []),
+                    error_msg=None
+                )
+                # 查找截图文件
+                screenshot_path = None
+                debug_files = [f for f in os.listdir('.') if f.startswith('debug_servers_')]
+                if debug_files:
+                    screenshot_path = debug_files[0]
+
+                send_notification("EUserv 续期成功", new_message, GLOBAL_CONFIG, screenshot_path)
+                break  # 只发送一次新样式通知
     else:
         logger.info("✅ 本次无续期操作，无需发送通知")
     

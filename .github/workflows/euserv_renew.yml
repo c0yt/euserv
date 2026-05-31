@@ -1,0 +1,100 @@
+name: EUserv 自动续期
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'euser_renew.py'
+      - '.github/workflows/euserv_renew.yml'
+  schedule:
+    - cron: '7 12 * * *'      # 北京时间晚上 20:07 (UTC+8)
+    - cron: '37 0 * * *'      # 北京时间早上 08:37 (UTC+8)
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  renew:
+    name: 执行续期
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 启用 WARP 网络
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS 并验证网络
+        run: |
+          echo "[信息] 停用 systemd-resolved，设置公共 DNS..."
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          sleep 2
+
+          echo "[信息] DNS 测试:"
+          nslookup euserv.com 1.1.1.1 || echo "[警告] 解析失败"
+
+          echo ""
+          echo "[信息] 当前出口 IP:"
+          curl -s --max-time 10 https://api.ipify.org && echo
+          echo "[信息] WARP 状态:"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 执行续期脚本
+        env:
+          EUSERV_EMAIL: ${{ secrets.EUSERV_EMAIL }}
+          EUSERV_PASSWORD: ${{ secrets.EUSERV_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+        run: python euser_renew.py
+
+      - name: 上传调试文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-files-${{ github.run_number }}
+          path: |
+            debug_*.html
+            screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 保活提交
+        if: always()
+        run: |
+          date > last_run.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_run.txt
+          git commit -m "保活: $(date)" || echo "无需提交"
+          git push
+
+      - name: 清理历史运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
