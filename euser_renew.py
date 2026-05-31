@@ -625,6 +625,18 @@ class EUserv:
             if any(success_checks):
                 logger.info(f"✅ 账号 {self.config.email} 登录成功")
                 self.sess_id = sess_id
+
+                # 登录成功后，主动访问一次主页面，确保会话完全建立
+                logger.info("正在初始化会话...")
+                time.sleep(2)
+                try:
+                    main_page_url = f"https://support.euserv.com/index.iphp?sess_id={sess_id}"
+                    init_response = self.session.get(main_page_url, headers=headers, timeout=30)
+                    init_response.raise_for_status()
+                    logger.info("✅ 会话初始化完成")
+                except Exception as e:
+                    logger.warning(f"⚠️ 会话初始化失败: {e}")
+
                 return True
             else:
                 logger.error(f"❌ 账号 {self.config.email} 登录失败")
