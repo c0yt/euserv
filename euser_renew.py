@@ -800,7 +800,7 @@ class EUserv:
 
 
     def get_servers(self) -> Dict[str, Tuple[bool, str]]:
-        """获取服务器列表"""
+        """获取服务器列表（带重试机制）"""
         logger.info(f"正在获取账号 {self.config.email} 的服务器列表...")
 
         if not self.sess_id:
@@ -810,28 +810,44 @@ class EUserv:
         url = f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}"
         headers = {'user-agent': USER_AGENT, 'origin': 'https://www.euserv.com'}
 
-        try:
-            detail_response = self.session.get(url=url, headers=headers)
-            detail_response.raise_for_status()
+        # 重试机制：最多尝试 3 次
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.warning(f"⚠️ 第 {attempt + 1}/{max_retries} 次尝试获取服务器列表...")
+                    time.sleep(3)  # 重试前等待 3 秒
 
-            # 调试：保存 HTML 响应
-            debug_file = f"debug_servers_{re.sub(r'[^\w@.-]', '_', self.config.email)}.html"
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                f.write(detail_response.text)
-            logger.info(f"🔍 调试：已保存服务器列表页面到 {debug_file}")
+                detail_response = self.session.get(url=url, headers=headers, timeout=30)
+                detail_response.raise_for_status()
 
-            soup = BeautifulSoup(detail_response.text, 'html.parser')
-            servers = {}
+                # 调试：保存 HTML 响应
+                debug_file = f"debug_servers_{re.sub(r'[^\w@.-]', '_', self.config.email)}.html"
+                with open(debug_file, 'w', encoding='utf-8') as f:
+                    f.write(detail_response.text)
+                logger.info(f"🔍 调试：已保存服务器列表页面到 {debug_file}")
 
-            # 修复1: 动态匹配所有 Tab，不硬编码 ID
-            all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
-            logger.info(f"🔍 调试：找到 {len(all_tabs)} 个订单 Tab")
+                soup = BeautifulSoup(detail_response.text, 'html.parser')
+                servers = {}
 
-            for tab in all_tabs:
-                rows = tab.select('.kc2_order_table.kc2_content_table tr')
-                logger.info(f"🔍 调试：当前 Tab 找到 {len(rows)} 行数据")
+                # 修复1: 动态匹配所有 Tab，不硬编码 ID
+                all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
+                logger.info(f"🔍 调试：找到 {len(all_tabs)} 个订单 Tab")
 
-                for tr in rows:
+                # 如果没有找到 Tab，可能是页面加载不完整，重试
+                if len(all_tabs) == 0:
+                    logger.warning(f"⚠️ 未找到订单 Tab，可能页面加载不完整")
+                    if attempt < max_retries - 1:
+                        continue  # 重试
+                    else:
+                        logger.error("❌ 多次尝试后仍未找到订单 Tab")
+                        return {}
+
+                for tab in all_tabs:
+                    rows = tab.select('.kc2_order_table.kc2_content_table tr')
+                    logger.info(f"🔍 调试：当前 Tab 找到 {len(rows)} 行数据")
+
+                    for tr in rows:
                     server_id_cells = tr.select('.td-z1-sp1-kc')
                     if len(server_id_cells) != 1:
                         continue
@@ -859,13 +875,16 @@ class EUserv:
 
                     server_id_text = server_id_cells[0].get_text(strip=True)
                     servers[server_id_text] = (can_renew, can_renew_date)
-            
-            logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
-            return servers
-            
-        except Exception as e:
-            logger.error(f"❌ 获取服务器列表失败: {e}", exc_info=True)
-            return {}
+
+                logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
+                return servers  # 成功获取，直接返回
+
+            except Exception as e:
+                logger.error(f"❌ 获取服务器列表失败 (尝试 {attempt + 1}/{max_retries}): {e}", exc_info=True)
+                if attempt < max_retries - 1:
+                    continue  # 重试
+                else:
+                    return {}  # 所有重试都失败，返回空字典
     
     def renew_server(self, order_id: str) -> bool:
         """续期服务器"""
