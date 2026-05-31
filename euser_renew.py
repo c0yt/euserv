@@ -116,10 +116,9 @@ class AccountConfig:
 
 class GlobalConfig:
     """全局配置"""
-    def __init__(self, telegram_bot_token="", telegram_chat_id="", bark_url="", max_workers=3, max_login_retries=3):
+    def __init__(self, telegram_bot_token="", telegram_chat_id="", max_workers=3, max_login_retries=3):
         self.telegram_bot_token = telegram_bot_token
         self.telegram_chat_id = telegram_chat_id
-        self.bark_url = bark_url  # 新增：Bark 推送 URL
         self.max_workers = max_workers
         self.max_login_retries = max_login_retries
 
@@ -129,7 +128,6 @@ class GlobalConfig:
 GLOBAL_CONFIG = GlobalConfig(
     telegram_bot_token=os.getenv("TG_BOT_TOKEN"),   # TG 的 API Token
     telegram_chat_id=os.getenv("TG_CHAT_ID"),        # TG 的 User ID
-    bark_url=os.getenv("BARK_URL"),                  # iOS Bark 推送，格式：https://api.day.app/your_key/
     max_workers=int(os.getenv("MAX_WORKERS", 3)),
     max_login_retries=int(os.getenv("MAX_LOGIN_RETRIES", 5)),
 )
@@ -985,46 +983,6 @@ class EUserv:
 
 
 
-def send_bark(title: str, content: str, config: GlobalConfig):
-    """
-    发送 Bark 推送通知
-    
-    Args:
-        title: 推送标题
-        content: 推送内容
-        config: 全局配置对象
-    """
-    if not config.bark_url:
-        logger.warning("⚠️ 未配置 Bark URL，跳过 Bark 通知")
-        return
-    
-    try:
-        post_url = config.bark_url.rstrip('/')
-        data = {
-            "title": title,
-            "body": content,
-            "sound": "telegraph",  # 推送音效
-            "group": "EUserv",     # 分组
-            "icon": "https://www.euserv.com/favicon.ico"  # 自定义图标
-        }
-        
-        # 发送请求
-        response = requests.post(post_url, json=data, timeout=20)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('code') == 200:
-                logger.info("✅ Bark 推送发送成功")
-            else:
-                logger.error(f"❌ Bark 推送失败: {result.get('message', '未知错误')}")
-        else:
-            logger.error(f"❌ Bark 推送失败: HTTP {response.status_code}")
-            
-    except Exception as e:
-        logger.error(f"❌ Bark 推送异常: {e}", exc_info=True)
-
-
-
 def send_telegram(message: str, config: GlobalConfig, photo_path: str = None):
     """发送 Telegram 通知（支持图片）"""
     if not config.telegram_bot_token or not config.telegram_chat_id:
@@ -1143,20 +1101,16 @@ def build_notification_message(account_email: str, servers: dict, renew_results:
 
 def send_notification(title: str, message: str, config: GlobalConfig, photo_path: str = None):
     """
-    统一发送通知（支持 Telegram 和 Bark，支持图片）
+    发送 Telegram 通知（支持图片）
 
     Args:
-        title: 通知标题（主要用于 Bark）
+        title: 通知标题（未使用，保留兼容性）
         message: 通知内容
         config: 全局配置对象
         photo_path: 截图路径（可选）
     """
     # 发送 Telegram 通知（支持图片）
     send_telegram(message, config, photo_path)
-
-    # 发送 Bark 通知（将 HTML 格式转为纯文本）
-    plain_message = re.sub(r'<[^>]+>', '', message)  # 移除 HTML 标签
-    send_bark(title, plain_message, config)
 
 
 def process_account(account_config: AccountConfig, global_config: GlobalConfig) -> Dict:
