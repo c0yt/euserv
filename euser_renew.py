@@ -851,18 +851,11 @@ class EUserv:
                         logger.error("❌ 多次尝试后仍然无法访问订单页面")
                         return {}
 
-                # 调试：保存 HTML 响应
-                debug_file = f"debug_servers_{re.sub(r'[^\w@.-]', '_', self.config.email)}.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(detail_response.text)
-                logger.info(f"🔍 调试：已保存服务器列表页面到 {debug_file}")
-
                 soup = BeautifulSoup(detail_response.text, 'html.parser')
                 servers = {}
 
                 # 修复1: 动态匹配所有 Tab，不硬编码 ID
                 all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
-                logger.info(f"🔍 调试：找到 {len(all_tabs)} 个订单 Tab")
 
                 # 如果没有找到 Tab，可能是页面加载不完整，重试
                 if len(all_tabs) == 0:
@@ -875,7 +868,6 @@ class EUserv:
 
                 for tab in all_tabs:
                     rows = tab.select('.kc2_order_table.kc2_content_table tr')
-                    logger.info(f"🔍 调试：当前 Tab 找到 {len(rows)} 行数据")
 
                     for tr in rows:
                         server_id_cells = tr.select('.td-z1-sp1-kc')
@@ -1341,6 +1333,9 @@ def main():
     notify_parts = []   # 需要通知的内容片段
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # 用于新样式通知的数据
+    all_accounts_data = []
+
     for result in all_results:
         email = result['email']
         logger.info(f"\n账号: {email}")
@@ -1360,6 +1355,14 @@ def main():
                 notify_parts.append(
                     f"<b>📧 {email}</b>\n  ❌ 处理异常: {error_msg}"
                 )
+
+            # 记录失败账号数据
+            all_accounts_data.append({
+                'email': email,
+                'servers': {},
+                'renew_results': [],
+                'error_msg': error_msg
+            })
             continue
 
         servers = result.get('servers', {})
@@ -1371,6 +1374,12 @@ def main():
             notify_parts.append(
                 f"<b>📧 {email}</b>\n  ⚠️ 获取服务器信息失败: {result.get('error')}"
             )
+            all_accounts_data.append({
+                'email': email,
+                'servers': {},
+                'renew_results': [],
+                'error_msg': result.get('error')
+            })
             continue
 
         renew_results = result.get('renew_results', [])
@@ -1385,38 +1394,36 @@ def main():
                 f"<b>📧 {email}</b>\n" + "\n".join(renew_lines)
             )
         else:
-            # ⑤ 无需续期 → 仅记录日志，不发通知
+            # ⑤ 无需续期 → 也要通知
             logger.info("  ✓ 所有服务器均无需续期")
             for order_id, (can_renew, can_renew_date) in servers.items():
                 if can_renew_date:
                     logger.info(f"    订单 {order_id}: 可续期日期 {can_renew_date}")
 
-    # 只有存在需要通知的事件时才发送
+        # 记录账号数据（用于新样式通知）
+        all_accounts_data.append({
+            'email': email,
+            'servers': servers,
+            'renew_results': renew_results,
+            'error_msg': None
+        })
+
+    # 发送通知（所有情况都发送）
     if notify_parts:
-        # 使用旧的通知方式（保持兼容）
+        # 旧样式通知（有续期操作或错误时）
         header = f"<b>🔄 EUserv 续期通知</b>\n时间: {time_str}\n"
         message = header + "\n\n".join(notify_parts)
         send_notification("EUserv 续期通知", message, GLOBAL_CONFIG)
 
-        # 同时使用新样式通知（如果有续期操作）
-        for result in all_results:
-            if result.get('success') and result.get('renew_results'):
-                new_message = build_notification_message(
-                    account_email=result['email'],
-                    servers=result.get('servers', {}),
-                    renew_results=result.get('renew_results', []),
-                    error_msg=None
-                )
-                # 查找截图文件
-                screenshot_path = None
-                debug_files = [f for f in os.listdir('.') if f.startswith('debug_servers_')]
-                if debug_files:
-                    screenshot_path = debug_files[0]
-
-                send_notification("EUserv 续期成功", new_message, GLOBAL_CONFIG, screenshot_path)
-                break  # 只发送一次新样式通知
-    else:
-        logger.info("✅ 本次无续期操作，无需发送通知")
+    # 新样式通知（所有账号都发送）
+    for account_data in all_accounts_data:
+        new_message = build_notification_message(
+            account_email=account_data['email'],
+            servers=account_data['servers'],
+            renew_results=account_data['renew_results'],
+            error_msg=account_data['error_msg']
+        )
+        send_notification("EUserv 自动续期", new_message, GLOBAL_CONFIG)
     
     logger.info("\n" + "=" * 60)
     logger.info("执行完成")
