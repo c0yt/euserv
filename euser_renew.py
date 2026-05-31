@@ -817,9 +817,14 @@ class EUserv:
 
         if not self.sess_id:
             logger.error("❌ 未登录")
-            return {}
+            return
 
-        url = f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}"
+        # 尝试两个不同的 URL
+        urls = [
+            f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}&action=showorders",  # 直接访问订单页面
+            f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}"  # 主页面
+        ]
+
         headers = {'user-agent': USER_AGENT, 'origin': 'https://www.euserv.com'}
 
         # 重试机制：最多尝试 3 次
@@ -830,8 +835,21 @@ class EUserv:
                     logger.warning(f"⚠️ 第 {attempt + 1}/{max_retries} 次尝试获取服务器列表...")
                     time.sleep(3)  # 重试前等待 3 秒
 
+                # 选择 URL（第一次尝试用订单页面，失败后用主页面）
+                url = urls[0] if attempt == 0 else urls[1]
+                logger.info(f"🔍 尝试访问: {url}")
+
                 detail_response = self.session.get(url=url, headers=headers, timeout=30)
                 detail_response.raise_for_status()
+
+                # 检查是否有错误信息
+                if "ERROR: This function can not be used" in detail_response.text:
+                    logger.warning(f"⚠️ EUserv 返回错误: 此功能无法使用")
+                    if attempt < max_retries - 1:
+                        continue  # 重试
+                    else:
+                        logger.error("❌ 多次尝试后仍然无法访问订单页面")
+                        return {}
 
                 # 调试：保存 HTML 响应
                 debug_file = f"debug_servers_{re.sub(r'[^\w@.-]', '_', self.config.email)}.html"
