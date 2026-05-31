@@ -802,26 +802,36 @@ class EUserv:
     def get_servers(self) -> Dict[str, Tuple[bool, str]]:
         """获取服务器列表"""
         logger.info(f"正在获取账号 {self.config.email} 的服务器列表...")
-        
+
         if not self.sess_id:
             logger.error("❌ 未登录")
             return {}
-        
+
         url = f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}"
         headers = {'user-agent': USER_AGENT, 'origin': 'https://www.euserv.com'}
-        
+
         try:
             detail_response = self.session.get(url=url, headers=headers)
             detail_response.raise_for_status()
+
+            # 调试：保存 HTML 响应
+            debug_file = f"debug_servers_{re.sub(r'[^\w@.-]', '_', self.config.email)}.html"
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                f.write(detail_response.text)
+            logger.info(f"🔍 调试：已保存服务器列表页面到 {debug_file}")
 
             soup = BeautifulSoup(detail_response.text, 'html.parser')
             servers = {}
 
             # 修复1: 动态匹配所有 Tab，不硬编码 ID
             all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
-            
+            logger.info(f"🔍 调试：找到 {len(all_tabs)} 个订单 Tab")
+
             for tab in all_tabs:
-                for tr in tab.select('.kc2_order_table.kc2_content_table tr'):
+                rows = tab.select('.kc2_order_table.kc2_content_table tr')
+                logger.info(f"🔍 调试：当前 Tab 找到 {len(rows)} 行数据")
+
+                for tr in rows:
                     server_id_cells = tr.select('.td-z1-sp1-kc')
                     if len(server_id_cells) != 1:
                         continue
