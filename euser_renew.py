@@ -848,33 +848,33 @@ class EUserv:
                     logger.info(f"🔍 调试：当前 Tab 找到 {len(rows)} 行数据")
 
                     for tr in rows:
-                    server_id_cells = tr.select('.td-z1-sp1-kc')
-                    if len(server_id_cells) != 1:
-                        continue
-                    
-                    # 修复2: 取所有 td-z1-sp2-kc，用索引 [2] 拿 Actions 列
-                    action_cells = tr.select('.td-z1-sp2-kc')
-                    if len(action_cells) < 3:
-                        continue
-                    
-                    # Actions 列是第 3 个（索引 2）
-                    action_text = action_cells[2].get_text(strip=True)
-                    logger.debug(f"续期信息: {action_text}")
+                        server_id_cells = tr.select('.td-z1-sp1-kc')
+                        if len(server_id_cells) != 1:
+                            continue
 
-                    can_renew = True
-                    can_renew_date = ""
-                    
-                    if "Contract extension possible from" in action_text:
-                        date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', action_text)
-                        if date_match:
-                            can_renew_date = date_match.group(1)
-                            can_renew = datetime.today().date() >= datetime.strptime(can_renew_date, "%Y-%m-%d").date()
-                        else:
-                            # 有提示但没解析出日期，保守处理为不可续期
-                            can_renew = False
+                        # 修复2: 取所有 td-z1-sp2-kc，用索引 [2] 拿 Actions 列
+                        action_cells = tr.select('.td-z1-sp2-kc')
+                        if len(action_cells) < 3:
+                            continue
 
-                    server_id_text = server_id_cells[0].get_text(strip=True)
-                    servers[server_id_text] = (can_renew, can_renew_date)
+                        # Actions 列是第 3 个（索引 2）
+                        action_text = action_cells[2].get_text(strip=True)
+                        logger.debug(f"续期信息: {action_text}")
+
+                        can_renew = True
+                        can_renew_date = ""
+
+                        if "Contract extension possible from" in action_text:
+                            date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', action_text)
+                            if date_match:
+                                can_renew_date = date_match.group(1)
+                                can_renew = datetime.today().date() >= datetime.strptime(can_renew_date, "%Y-%m-%d").date()
+                            else:
+                                # 有提示但没解析出日期，保守处理为不可续期
+                                can_renew = False
+
+                        server_id_text = server_id_cells[0].get_text(strip=True)
+                        servers[server_id_text] = (can_renew, can_renew_date)
 
                 logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
                 return servers  # 成功获取，直接返回
