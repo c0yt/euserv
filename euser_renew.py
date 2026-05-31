@@ -434,63 +434,11 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str) -> Optiona
 class EUserv:
     """EUserv 操作类"""
 
-    # Cookie 文件保存目录
-    COOKIE_DIR = "cookies"
-
     def __init__(self, config: AccountConfig):
         self.config = config
         self.session = requests.Session()
         self.sess_id = None
         self.c_id = None
-        # 每个账号对应一个独立的 cookie 文件
-        os.makedirs(self.COOKIE_DIR, exist_ok=True)
-        safe_name = re.sub(r'[^\w@.-]', '_', config.email)
-        self.cookie_file = os.path.join(self.COOKIE_DIR, f"{safe_name}.json")
-        # 初始化时尝试加载已保存的 Cookie（让服务器识别为受信任设备，跳过 PIN）
-        self._load_cookies()
-
-    def _save_cookies(self):
-        """将当前 session 的 Cookie 持久化到文件（保留完整属性）"""
-        try:
-            cookies = [
-                {
-                    'name':    c.name,
-                    'value':   c.value,
-                    'domain':  c.domain or 'support.euserv.com',
-                    'path':    c.path or '/',
-                    'expires': c.expires,
-                    'secure':  c.secure,
-                }
-                for c in self.session.cookies
-            ]
-            with open(self.cookie_file, 'w', encoding='utf-8') as f:
-                json.dump(cookies, f)
-            logger.info(f"✅ 信任设备 Cookie 已保存: {self.cookie_file}")
-        except Exception as e:
-            logger.warning(f"⚠️ 保存 Cookie 失败: {e}")
-
-    def _load_cookies(self):
-        """从文件加载 Cookie 到 session，兼容旧版 name→value 格式"""
-        if not os.path.exists(self.cookie_file):
-            return
-        try:
-            with open(self.cookie_file, 'r', encoding='utf-8') as f:
-                cookies = json.load(f)
-            # 兼容旧格式 {"name": "value", ...}
-            if isinstance(cookies, dict):
-                for name, value in cookies.items():
-                    self.session.cookies.set(name, value, domain='support.euserv.com')
-            else:
-                # 新格式：完整属性列表
-                for c in cookies:
-                    self.session.cookies.set(
-                        c['name'], c['value'],
-                        domain=c.get('domain', 'support.euserv.com'),
-                        path=c.get('path', '/'),
-                    )
-            logger.info(f"🍪 已加载信任设备 Cookie，登录时将跳过 PIN 验证")
-        except Exception as e:
-            logger.warning(f"⚠️ 加载 Cookie 失败: {e}")
 
     def login(self) -> bool:
         """登录 EUserv（支持验证码和 PIN，Cookie 持久化跳过 PIN）"""
@@ -611,9 +559,7 @@ class EUserv:
                 response = self.session.post(url, headers=headers, data=login_confirm_data)
                 response.raise_for_status()
 
-                # PIN 验证成功后，服务器种下信任设备 Cookie，立即持久化
-                self._save_cookies()
-                logger.info("🍪 PIN 验证完成，信任设备 Cookie 已保存，下次登录将跳过 PIN")
+                logger.info("✅ PIN 验证完成")
 
             # 检查登录成功
             success_checks = [
