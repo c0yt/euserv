@@ -17,6 +17,7 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
 
 from PIL import Image
 import ddddocr
@@ -48,6 +49,73 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 
 # ============== 工具函数 ==============
+_SESS_ID_PATTERNS = (
+    r'sess_id["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]{24,128})["\']?',
+    r'[?&]sess_id=([a-zA-Z0-9]{24,128})',
+    r'name=["\']sess_id["\'][^>]*value=["\']([a-zA-Z0-9]{24,128})["\']',
+)
+
+
+def extract_sess_id(text: str) -> Optional[str]:
+    """Extract the latest sess_id from html or url text."""
+    if not text:
+        return None
+
+    for pattern in _SESS_ID_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def detect_page_state(html: str) -> str:
+    """Return a coarse page state for logging and retry decisions."""
+    if not html:
+        return "empty"
+
+    lower = html.lower()
+    if 'please check email address/customer id and password' in lower:
+        return "login_error"
+    if 'pin that you receive via email' in lower:
+        return "pin"
+    if 'captcha' in lower and 'securimage' in lower:
+        return "captcha"
+    if 'error: this function can not be used' in lower:
+        return "function_blocked"
+    if 'kc2_order_customer_orders_tab_content_' in html:
+        return "orders_tab"
+    if 'kc2_order_table' in html and 'td-z1-sp1-kc' in html:
+        return "orders_table"
+    if 'contract extension possible from' in lower or 'show_contract_details' in lower:
+        return "orders_table"
+    if 'confirm or change your customer data here' in lower:
+        return "customer_data"
+    if 'action=show_customerdata' in lower or 'name="c_fname"' in lower or "name='c_fname'" in lower:
+        return "customer_data"
+    if 'logout' in lower and 'customer' in lower:
+        return "dashboard"
+    if 'subaction=login' in lower or 'name="email"' in lower:
+        return "login_page"
+    return "unknown"
+
+
+def dump_debug_html(prefix: str, html: str) -> Optional[str]:
+    """Persist debug html so GitHub Actions artifacts can capture the real page."""
+    if not html:
+        return None
+
+    safe_prefix = re.sub(r'[^A-Za-z0-9_.-]+', '_', prefix).strip('._') or 'page'
+    safe_thread = re.sub(r'[^A-Za-z0-9_.-]+', '_', threading.current_thread().name)
+    filename = f"debug_{safe_prefix}_{safe_thread}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html)
+        return filename
+    except Exception as exc:
+        logger.warning(f"Failed to save debug html {filename}: {exc}")
+        return None
+
+
 def resolve_imap_server(email: str) -> str:
     """
     根据邮箱域名自动推断 IMAP 服务器地址。
@@ -437,6 +505,136 @@ class EUserv:
         self.session = requests.Session()
         self.sess_id = None
         self.c_id = None
+        self.orders_url = None
+        self.last_page_state = "unknown"
+
+    def _extract_orders_url(self, html: str, soup: Optional[BeautifulSoup] = None) -> Optional[str]:
+        """Find a real orders page url from anchors, redirects or inline links."""
+        if not html:
+            return None
+
+        if soup is None:
+            soup = BeautifulSoup(html, "html.parser")
+
+        for tag in soup.find_all('a', href=True):
+            href = tag.get('href', '').strip()
+            if href and 'showorders' in href.lower():
+                return urljoin("https://support.euserv.com/", href)
+
+        meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+        if meta_refresh and meta_refresh.get('content'):
+            match = re.search(r'url\s*=\s*([^;]+)$', meta_refresh['content'], re.IGNORECASE)
+            if match and 'showorders' in match.group(1).lower():
+                return urljoin("https://support.euserv.com/", match.group(1).strip())
+
+        regex_patterns = (
+            r'((?:https://support\.euserv\.com/)?index\.iphp\?[^"\']*action=showorders[^"\']*)',
+            r'((?:https://support\.euserv\.com/)?index\.iphp\?[^"\']*(?:action|subaction)=[^"\']*order[^"\']*)',
+        )
+        for pattern in regex_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                return urljoin("https://support.euserv.com/", match.group(1))
+
+        return None
+
+    def _track_response(self, response: requests.Response, context: str = "") -> BeautifulSoup:
+        """Refresh sess_id/c_id/orders_url from the latest response."""
+        new_sess_id = extract_sess_id(response.text) or extract_sess_id(response.url)
+        if new_sess_id:
+            self.sess_id = new_sess_id
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        c_id_input = soup.find("input", {"name": "c_id"})
+        if c_id_input and c_id_input.get("value"):
+            self.c_id = c_id_input.get("value", "").strip()
+
+        order_url = self._extract_orders_url(response.text, soup)
+        if order_url:
+            self.orders_url = order_url
+
+        self.last_page_state = detect_page_state(response.text)
+        if context:
+            logger.debug(f"[{context}] page_state={self.last_page_state}, sess_id={'yes' if self.sess_id else 'no'}")
+        return soup
+
+    def _build_orders_candidates(self) -> List[str]:
+        """Build likely authenticated entry urls for the orders page."""
+        urls = []
+        if self.orders_url:
+            urls.append(self.orders_url)
+
+        if self.sess_id:
+            urls.extend([
+                f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}&action=showorders",
+                f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}&subaction=show_kwk_main",
+                f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}",
+            ])
+
+        deduped = []
+        seen = set()
+        for url in urls:
+            if url and url not in seen:
+                deduped.append(url)
+                seen.add(url)
+        return deduped
+
+    def _prime_session(self, headers: Dict[str, str]) -> None:
+        """Walk through a few authenticated pages so the first run is not stuck on an intermediate page."""
+        for idx, url in enumerate(self._build_orders_candidates(), start=1):
+            try:
+                response = self.session.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                self._track_response(response, f"prime_{idx}")
+                if self.last_page_state.startswith("orders"):
+                    logger.info("✅ 会话初始化完成（已进入订单页面）")
+                    return
+                time.sleep(1.5)
+            except Exception as exc:
+                logger.debug(f"Prime session request failed at step {idx}: {exc}")
+
+        logger.info(f"✅ 会话初始化完成（当前页面状态: {self.last_page_state}）")
+
+    def _parse_servers_from_soup(self, soup: BeautifulSoup) -> Dict[str, Tuple[bool, str]]:
+        """Parse servers from the order page with or without tab wrappers."""
+        servers = {}
+        rows = []
+
+        all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
+        for tab in all_tabs:
+            rows.extend(tab.select('.kc2_order_table.kc2_content_table tr'))
+
+        if not rows:
+            rows = soup.select('.kc2_order_table.kc2_content_table tr')
+
+        for tr in rows:
+            server_id_cells = tr.select('.td-z1-sp1-kc')
+            if len(server_id_cells) != 1:
+                continue
+
+            action_cells = tr.select('.td-z1-sp2-kc')
+            if len(action_cells) < 3:
+                continue
+
+            action_text = action_cells[2].get_text(strip=True)
+            logger.debug(f"续期信息: {action_text}")
+
+            can_renew = True
+            can_renew_date = ""
+
+            if "Contract extension possible from" in action_text:
+                date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', action_text)
+                if date_match:
+                    can_renew_date = date_match.group(1)
+                    can_renew = datetime.today().date() >= datetime.strptime(can_renew_date, "%Y-%m-%d").date()
+                else:
+                    can_renew = False
+
+            server_id_text = server_id_cells[0].get_text(strip=True)
+            servers[server_id_text] = (can_renew, can_renew_date)
+
+        return servers
 
     def login(self) -> bool:
         """登录 EUserv（支持验证码和 PIN，Cookie 持久化跳过 PIN）"""
@@ -452,15 +650,13 @@ class EUserv:
         try:
             # 获取 sess_id（session 里已携带 Cookie，服务器可识别为受信任设备）
             sess = self.session.get(url, headers=headers)
-            sess_id_match = re.search(r'sess_id["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]{30,100})["\']?', sess.text)
-            if not sess_id_match:
-                sess_id_match = re.search(r'sess_id=([a-zA-Z0-9]{30,100})', sess.text)
+            self._track_response(sess, "login_entry")
+            sess_id = self.sess_id or extract_sess_id(sess.text)
 
-            if not sess_id_match:
+            if not sess_id:
                 logger.error("❌ 无法获取 sess_id")
                 return False
 
-            sess_id = sess_id_match.group(1)
             logger.debug(f"获取到 sess_id: {sess_id[:20]}...")
 
             # 访问 logo
@@ -482,7 +678,7 @@ class EUserv:
             response.raise_for_status()
 
             # 解析返回页面
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = self._track_response(response, "login_submit")
 
             # 检查登录错误
             if 'Please check email address/customer ID and password' in response.text:
@@ -516,6 +712,7 @@ class EUserv:
 
                     response = self.session.post(url, headers=headers, data=captcha_data)
                     response.raise_for_status()
+                    soup = self._track_response(response, f"captcha_{captcha_attempt + 1}")
 
                     if 'captcha' in response.text.lower():
                         logger.warning(f"❌ 验证码错误（第 {captcha_attempt + 1} 次）")
@@ -525,14 +722,26 @@ class EUserv:
                             logger.error("❌ 验证码错误次数过多，重新进入登录流程")
                             return False
                     else:
-                        soup = BeautifulSoup(response.text, "html.parser")
                         logger.info("✅ 验证码验证成功")
                         break
 
             # 处理 PIN 验证
             # 若之前 Cookie 有效，服务器不会返回 PIN 页面，直接跳过这段
             if 'PIN that you receive via email' in response.text:
-                self.c_id = soup.find("input", {"name": "c_id"})["value"]
+                pin_c_id = self.c_id
+                if not pin_c_id:
+                    c_id_input = soup.find("input", {"name": "c_id"})
+                    if c_id_input and c_id_input.get("value"):
+                        pin_c_id = c_id_input.get("value", "").strip()
+                        self.c_id = pin_c_id
+                if not pin_c_id:
+                    debug_file = dump_debug_html(f"pin_missing_cid_{self.config.email}", response.text)
+                    if debug_file:
+                        logger.error(f"❌ PIN 页面缺少 c_id，已保存调试页面: {debug_file}")
+                    else:
+                        logger.error("❌ PIN 页面缺少 c_id")
+                    return False
+
                 logger.info("⚠️ 需要 PIN 验证（首次登录或 Cookie 已失效）")
                 time.sleep(3)
 
@@ -552,10 +761,11 @@ class EUserv:
                     'sess_id': sess_id,
                     'Submit': 'Confirm',
                     'subaction': 'login',
-                    'c_id': self.c_id,
+                    'c_id': pin_c_id,
                 }
                 response = self.session.post(url, headers=headers, data=login_confirm_data)
                 response.raise_for_status()
+                soup = self._track_response(response, "login_pin_confirm")
 
                 logger.info("✅ PIN 验证完成")
 
@@ -566,18 +776,15 @@ class EUserv:
                 'logout' in response.text.lower() and 'customer' in response.text.lower()
             ]
 
-            if any(success_checks):
+            if any(success_checks) or self.last_page_state in {"customer_data", "dashboard", "orders_tab", "orders_table"}:
                 logger.info(f"✅ 账号 {self.config.email} 登录成功")
-                self.sess_id = sess_id
+                self.sess_id = self.sess_id or sess_id
 
-                # 登录成功后，主动访问一次主页面，确保会话完全建立
+                # 登录成功后，主动走一次主页面和订单页面，确保首跑会话完全建立
                 logger.info("正在初始化会话...")
                 time.sleep(2)
                 try:
-                    main_page_url = f"https://support.euserv.com/index.iphp?sess_id={sess_id}"
-                    init_response = self.session.get(main_page_url, headers=headers, timeout=30)
-                    init_response.raise_for_status()
-                    logger.info("✅ 会话初始化完成")
+                    self._prime_session(headers)
                 except Exception as e:
                     logger.warning(f"⚠️ 会话初始化失败: {e}")
 
@@ -761,88 +968,64 @@ class EUserv:
 
         if not self.sess_id:
             logger.error("❌ 未登录")
-            return
-
-        # 尝试两个不同的 URL
-        urls = [
-            f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}&action=showorders",  # 直接访问订单页面
-            f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}"  # 主页面
-        ]
+            return {}
 
         headers = {'user-agent': USER_AGENT, 'origin': 'https://www.euserv.com'}
 
         # 重试机制：最多尝试 5 次
         max_retries = 5
+        last_html = ""
+        last_state = "unknown"
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
                     logger.warning(f"⚠️ 第 {attempt + 1}/{max_retries} 次尝试获取服务器列表...")
                     time.sleep(5)  # 重试前等待 5 秒
 
-                # 选择 URL（前 2 次用订单页面，后面用主页面）
-                url = urls[0] if attempt < 2 else urls[1]
+                page_had_orders_markup = False
+                candidates = self._build_orders_candidates()
+                if not candidates:
+                    logger.warning("⚠️ 当前没有可用的订单页面候选 URL，重新初始化会话")
+                    self._prime_session(headers)
+                    candidates = self._build_orders_candidates()
 
-                detail_response = self.session.get(url=url, headers=headers, timeout=30)
-                detail_response.raise_for_status()
+                for idx, url in enumerate(candidates, start=1):
+                    detail_response = self.session.get(url=url, headers=headers, timeout=30)
+                    detail_response.raise_for_status()
 
-                # 检查是否有错误信息
-                if "ERROR: This function can not be used" in detail_response.text:
-                    logger.warning(f"⚠️ EUserv 返回错误: 此功能无法使用")
-                    if attempt < max_retries - 1:
-                        continue  # 重试
-                    else:
-                        logger.error("❌ 多次尝试后仍然无法访问订单页面")
-                        return {}
+                    soup = self._track_response(detail_response, f"get_servers_{attempt + 1}_{idx}")
+                    last_html = detail_response.text
+                    last_state = self.last_page_state
 
-                soup = BeautifulSoup(detail_response.text, 'html.parser')
-                servers = {}
+                    if self.last_page_state == "function_blocked":
+                        logger.warning("⚠️ EUserv 返回限制页面，此次继续尝试其他入口")
+                        continue
 
-                # 修复1: 动态匹配所有 Tab，不硬编码 ID
-                all_tabs = soup.select('[id^="kc2_order_customer_orders_tab_content_"]')
+                    servers = self._parse_servers_from_soup(soup)
+                    if servers:
+                        logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
+                        return servers
 
-                # 如果没有找到 Tab，可能是页面加载不完整，重试
-                if len(all_tabs) == 0:
-                    logger.warning(f"⚠️ 未找到订单 Tab，可能页面加载不完整")
-                    if attempt < max_retries - 1:
-                        continue  # 重试
-                    else:
-                        logger.error("❌ 多次尝试后仍未找到订单 Tab")
-                        return {}
+                    if self.last_page_state.startswith("orders"):
+                        page_had_orders_markup = True
+                        logger.warning("⚠️ 已进入订单页，但当前页面未解析出任何服务器，准备重试")
+                        continue
 
-                for tab in all_tabs:
-                    rows = tab.select('.kc2_order_table.kc2_content_table tr')
+                if page_had_orders_markup:
+                    logger.warning("⚠️ 订单页已打开，但内容仍不完整，等待后重试")
+                else:
+                    logger.warning(f"⚠️ 未进入有效订单页，当前页面状态: {last_state}")
 
-                    for tr in rows:
-                        server_id_cells = tr.select('.td-z1-sp1-kc')
-                        if len(server_id_cells) != 1:
-                            continue
+                if attempt < max_retries - 1:
+                    self._prime_session(headers)
+                    continue
 
-                        # 修复2: 取所有 td-z1-sp2-kc，用索引 [2] 拿 Actions 列
-                        action_cells = tr.select('.td-z1-sp2-kc')
-                        if len(action_cells) < 3:
-                            continue
-
-                        # Actions 列是第 3 个（索引 2）
-                        action_text = action_cells[2].get_text(strip=True)
-                        logger.debug(f"续期信息: {action_text}")
-
-                        can_renew = True
-                        can_renew_date = ""
-
-                        if "Contract extension possible from" in action_text:
-                            date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', action_text)
-                            if date_match:
-                                can_renew_date = date_match.group(1)
-                                can_renew = datetime.today().date() >= datetime.strptime(can_renew_date, "%Y-%m-%d").date()
-                            else:
-                                # 有提示但没解析出日期，保守处理为不可续期
-                                can_renew = False
-
-                        server_id_text = server_id_cells[0].get_text(strip=True)
-                        servers[server_id_text] = (can_renew, can_renew_date)
-
-                logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
-                return servers  # 成功获取，直接返回
+                debug_file = dump_debug_html(f"orders_missing_{self.config.email}", last_html)
+                if debug_file:
+                    logger.error(f"❌ 多次尝试后仍未获取到服务器列表，已保存调试页面: {debug_file}")
+                else:
+                    logger.error("❌ 多次尝试后仍未获取到服务器列表")
+                return {}
 
             except Exception as e:
                 logger.error(f"❌ 获取服务器列表失败 (尝试 {attempt + 1}/{max_retries}): {e}", exc_info=True)
