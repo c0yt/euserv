@@ -82,6 +82,8 @@ def detect_page_state(html: str) -> str:
         return "captcha"
     if 'error: this function can not be used' in lower:
         return "function_blocked"
+    if 'step1_anmeldung' in lower:
+        return "login_page"
     if 'kc2_order_customer_orders_tab_content_' in html:
         return "orders_tab"
     if 'kc2_order_table' in html and 'td-z1-sp1-kc' in html:
@@ -184,11 +186,20 @@ class AccountConfig:
 
 class GlobalConfig:
     """全局配置"""
-    def __init__(self, telegram_bot_token="", telegram_chat_id="", max_workers=3, max_login_retries=3):
+    def __init__(
+        self,
+        telegram_bot_token="",
+        telegram_chat_id="",
+        max_workers=3,
+        max_login_retries=3,
+        telegram_notify_mode="per_account"
+    ):
         self.telegram_bot_token = telegram_bot_token
         self.telegram_chat_id = telegram_chat_id
         self.max_workers = max_workers
         self.max_login_retries = max_login_retries
+        notify_mode = (telegram_notify_mode or "per_account").strip().lower()
+        self.telegram_notify_mode = notify_mode if notify_mode in {"per_account", "summary", "both"} else "per_account"
 
 
 # ============== 配置区 ==============
@@ -198,6 +209,7 @@ GLOBAL_CONFIG = GlobalConfig(
     telegram_chat_id=os.getenv("TG_CHAT_ID"),        # TG 的 User ID
     max_workers=int(os.getenv("MAX_WORKERS", 3)),
     max_login_retries=int(os.getenv("MAX_LOGIN_RETRIES", 5)),
+    telegram_notify_mode=os.getenv("TG_NOTIFY_MODE", "per_account"),
 )
 
 
@@ -507,6 +519,7 @@ class EUserv:
         self.c_id = None
         self.orders_url = None
         self.last_page_state = "unknown"
+        self.last_html = ""
 
     def _extract_orders_url(self, html: str, soup: Optional[BeautifulSoup] = None) -> Optional[str]:
         """Find a real orders page url from anchors, redirects or inline links."""
@@ -540,6 +553,7 @@ class EUserv:
 
     def _track_response(self, response: requests.Response, context: str = "") -> BeautifulSoup:
         """Refresh sess_id/c_id/orders_url from the latest response."""
+        self.last_html = response.text
         new_sess_id = extract_sess_id(response.text) or extract_sess_id(response.url)
         if new_sess_id:
             self.sess_id = new_sess_id
@@ -788,6 +802,16 @@ class EUserv:
                 except Exception as e:
                     logger.warning(f"⚠️ 会话初始化失败: {e}")
 
+                if not self.last_page_state.startswith("orders"):
+                    debug_file = dump_debug_html(
+                        f"after_login_{self.last_page_state}_{self.config.email}",
+                        self.last_html,
+                    )
+                    if debug_file:
+                        logger.warning(
+                            f"⚠️ 登录后未进入订单页（状态: {self.last_page_state}），已保存诊断页面: {debug_file}"
+                        )
+
                 return True
             else:
                 logger.error(f"❌ 账号 {self.config.email} 登录失败")
@@ -976,6 +1000,7 @@ class EUserv:
         max_retries = 5
         last_html = ""
         last_state = "unknown"
+        relogin_used = False
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
@@ -983,6 +1008,7 @@ class EUserv:
                     time.sleep(5)  # 重试前等待 5 秒
 
                 page_had_orders_markup = False
+                session_expired = False
                 candidates = self._build_orders_candidates()
                 if not candidates:
                     logger.warning("⚠️ 当前没有可用的订单页面候选 URL，重新初始化会话")
@@ -1001,6 +1027,11 @@ class EUserv:
                         logger.warning("⚠️ EUserv 返回限制页面，此次继续尝试其他入口")
                         continue
 
+                    if self.last_page_state == "login_page":
+                        logger.warning("⚠️ 检测到登录页，会话可能已失效")
+                        session_expired = True
+                        break
+
                     servers = self._parse_servers_from_soup(soup)
                     if servers:
                         logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
@@ -1017,7 +1048,15 @@ class EUserv:
                     logger.warning(f"⚠️ 未进入有效订单页，当前页面状态: {last_state}")
 
                 if attempt < max_retries - 1:
-                    self._prime_session(headers)
+                    if session_expired and not relogin_used:
+                        logger.warning("⚠️ 会话已失效，尝试重新登录...")
+                        relogin_used = True
+                        if self.login():
+                            logger.info("✅ 重新登录成功，继续获取服务器列表")
+                        else:
+                            logger.error("❌ 重新登录失败")
+                    else:
+                        self._prime_session(headers)
                     continue
 
                 debug_file = dump_debug_html(f"orders_missing_{self.config.email}", last_html)
@@ -1491,15 +1530,19 @@ def main():
         })
 
     # 发送通知（所有情况都发送）
-    if notify_parts:
+    should_send_summary = GLOBAL_CONFIG.telegram_notify_mode in {"summary", "both"}
+    should_send_per_account = GLOBAL_CONFIG.telegram_notify_mode in {"per_account", "both"}
+
+    if should_send_summary and notify_parts:
         # 旧样式通知（有续期操作或错误时）
         header = f"<b>🔄 EUserv 续期通知</b>\n时间: {time_str}\n"
         message = header + "\n\n".join(notify_parts)
         send_notification("EUserv 续期通知", message, GLOBAL_CONFIG)
 
     # 新样式通知（所有账号都发送）
-    for account_data in all_accounts_data:
-        new_message = build_notification_message(
+    if should_send_per_account:
+        for account_data in all_accounts_data:
+            new_message = build_notification_message(
             account_email=account_data['email'],
             servers=account_data['servers'],
             renew_results=account_data['renew_results'],
@@ -1513,5 +1556,98 @@ def main():
     os._exit(0)
 
 
+def main_v2():
+    """Single-path main entry that only sends the latest per-account notification."""
+    logger.info("=" * 60)
+    logger.info("EUserv auto-renew script")
+    logger.info(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Configured accounts: {len(ACCOUNTS)}")
+    logger.info(f"Max workers: {GLOBAL_CONFIG.max_workers}")
+    logger.info("=" * 60)
+
+    if not ACCOUNTS:
+        logger.error("No accounts configured")
+        sys.exit(1)
+
+    all_results = []
+    with ThreadPoolExecutor(max_workers=GLOBAL_CONFIG.max_workers) as executor:
+        future_to_account = {
+            executor.submit(process_account, account, GLOBAL_CONFIG): account
+            for account in ACCOUNTS
+            if account.email and str(account.email).strip()
+            and account.password and str(account.password).strip()
+            and account.email_password and str(account.email_password).strip()
+        }
+
+        for future in as_completed(future_to_account):
+            account = future_to_account[future]
+            try:
+                result = future.result()
+                all_results.append(result)
+            except Exception as exc:
+                logger.error(f"Unexpected error while processing {account.email}: {exc}", exc_info=True)
+                all_results.append({
+                    'email': account.email,
+                    'success': False,
+                    'servers': {},
+                    'renew_results': [],
+                    'error': f"Unexpected exception: {exc}",
+                    'error_type': 'exception',
+                })
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Result summary")
+    logger.info("=" * 60)
+
+    account_notifications = []
+    for result in all_results:
+        email = result.get('email', '')
+        servers = result.get('servers', {})
+        renew_results = result.get('renew_results', [])
+        error_type = result.get('error_type')
+        error_msg = result.get('error')
+
+        logger.info(f"\nAccount: {email}")
+
+        if not result.get('success'):
+            logger.error(f"  Failed: {error_msg or 'unknown error'}")
+        elif error_type == 'get_servers':
+            logger.warning(f"  Warning: {error_msg or 'failed to fetch servers'}")
+        else:
+            logger.info(f"  Server count: {len(servers)}")
+            if renew_results:
+                logger.info(f"  Renew operations: {len(renew_results)}")
+                for renew_result in renew_results:
+                    logger.info(f"    {renew_result['message']}")
+            else:
+                logger.info("  No renewal required")
+                for order_id, (_, can_renew_date) in servers.items():
+                    if can_renew_date:
+                        logger.info(f"    Order {order_id}: renewable from {can_renew_date}")
+
+        notification_error = error_msg if error_type in {'login', 'get_servers', 'exception'} else None
+        notification_servers = {} if error_type == 'get_servers' else servers
+        account_notifications.append({
+            'email': email,
+            'servers': notification_servers,
+            'renew_results': renew_results,
+            'error_msg': notification_error,
+        })
+
+    for account_data in account_notifications:
+        message = build_notification_message(
+            account_email=account_data['email'],
+            servers=account_data['servers'],
+            renew_results=account_data['renew_results'],
+            error_msg=account_data['error_msg']
+        )
+        send_notification("EUserv Auto Renew", message, GLOBAL_CONFIG)
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Execution finished")
+    logger.info("=" * 60)
+    os._exit(0)
+
+
 if __name__ == "__main__":
-    main()
+    main_v2()
