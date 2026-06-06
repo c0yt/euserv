@@ -14,8 +14,8 @@ import json
 import time
 import threading
 import logging
-from typing import Dict, List, Tuple, Optional
-from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Set
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
@@ -46,6 +46,9 @@ ocr = ddddocr.DdddOcr(beta=True)
 ocr_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
+PIN_FETCH_TIMEOUT = int(os.getenv("PIN_FETCH_TIMEOUT", "75"))
+PIN_POLL_INTERVAL = int(os.getenv("PIN_POLL_INTERVAL", "3"))
+PIN_LOOKBACK_SECONDS = int(os.getenv("PIN_LOOKBACK_SECONDS", "10"))
 
 
 # ============== 工具函数 ==============
@@ -76,14 +79,12 @@ def detect_page_state(html: str) -> str:
     lower = html.lower()
     if 'please check email address/customer id and password' in lower:
         return "login_error"
+    if 'error: this function can not be used' in lower:
+        return "function_blocked"
     if 'pin that you receive via email' in lower:
         return "pin"
     if 'captcha' in lower and 'securimage' in lower:
         return "captcha"
-    if 'error: this function can not be used' in lower:
-        return "function_blocked"
-    if 'step1_anmeldung' in lower:
-        return "login_page"
     if 'kc2_order_customer_orders_tab_content_' in html:
         return "orders_tab"
     if 'kc2_order_table' in html and 'td-z1-sp1-kc' in html:
@@ -96,7 +97,7 @@ def detect_page_state(html: str) -> str:
         return "customer_data"
     if 'logout' in lower and 'customer' in lower:
         return "dashboard"
-    if 'subaction=login' in lower or 'name="email"' in lower:
+    if 'step1_anmeldung' in lower or 'subaction=login' in lower or 'name="email"' in lower:
         return "login_page"
     return "unknown"
 
@@ -481,32 +482,83 @@ def calculate_operation(left: int, op: str, right: int, raw_text: str, silent: b
 
 
 
-def get_euserv_pin(email: str, email_password: str, imap_server: str) -> Optional[str]:
-    """从邮箱获取 EUserv PIN 码"""
-    try:
-        logger.info(f"正在从邮箱 {email} 获取 PIN 码...")
-        with MailBox(imap_server).login(email, email_password) as mailbox:
-            for msg in mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=1, reverse=True):
-                logger.debug(f"找到邮件: {msg.subject}, 收件时间: {msg.date_str}")
-                
-                match = re.search(r'PIN:\s*\n?(\d{6})', msg.text)
-                if match:
-                    pin = match.group(1)
-                    logger.info(f"✅ 提取到 PIN 码: {pin}")
-                    return pin
-                else:
-                    match_fallback = re.search(r'(\d{6})', msg.text)
-                    if match_fallback:
-                        pin = match_fallback.group(1)
-                        logger.warning(f"⚠️ 备选匹配 PIN 码: {pin}")
-                        return pin
-                    
-            logger.warning("❌ 未找到符合条件的 EUserv 邮件")
-            return None
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    except Exception as e:
-        logger.error(f"获取 PIN 码时发生错误: {e}", exc_info=True)
+
+def _normalize_datetime(value) -> Optional[datetime]:
+    if not isinstance(value, datetime):
         return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _extract_pin_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(r'PIN:\s*\n?(\d{6})', text)
+    if match:
+        return match.group(1)
+    match = re.search(r'\b(\d{6})\b', text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def get_euserv_pin(
+    email: str,
+    email_password: str,
+    imap_server: str,
+    requested_after: Optional[datetime] = None,
+    exclude_pins: Optional[Set[str]] = None,
+    timeout: int = PIN_FETCH_TIMEOUT,
+    poll_interval: int = PIN_POLL_INTERVAL,
+) -> Optional[str]:
+    """从邮箱获取本次请求产生的 EUserv PIN 码。"""
+    requested_after = _normalize_datetime(requested_after)
+    exclude_pins = set(exclude_pins or set())
+    deadline = time.time() + timeout
+    last_error = None
+    logged_wait = False
+
+    logger.info(f"正在从邮箱 {email} 获取 PIN 码...")
+    while time.time() <= deadline:
+        try:
+            with MailBox(imap_server).login(email, email_password) as mailbox:
+                for msg in mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=10, reverse=True):
+                    msg_date = _normalize_datetime(getattr(msg, "date", None))
+                    if requested_after and msg_date and msg_date < requested_after:
+                        logger.debug(f"跳过旧 PIN 邮件: {getattr(msg, 'subject', '')}, 时间: {getattr(msg, 'date_str', '')}")
+                        continue
+
+                    text = (getattr(msg, "text", None) or getattr(msg, "html", None) or "")
+                    pin = _extract_pin_from_text(text)
+                    if not pin:
+                        continue
+                    if pin in exclude_pins:
+                        logger.debug("跳过已使用过的 PIN 邮件")
+                        continue
+
+                    logger.info("✅ 提取到新的 PIN 码")
+                    return pin
+
+            if not logged_wait:
+                logger.info("尚未收到本次请求的新 PIN 邮件，继续等待...")
+                logged_wait = True
+            time.sleep(poll_interval)
+        except Exception as e:
+            last_error = e
+            if time.time() + poll_interval > deadline:
+                break
+            logger.warning(f"获取 PIN 码暂时失败，将重试: {e}")
+            time.sleep(poll_interval)
+
+    if last_error:
+        logger.error(f"获取 PIN 码时发生错误: {last_error}")
+    else:
+        logger.warning("❌ 未找到本次请求对应的 EUserv PIN 邮件")
+    return None
 
 
 class EUserv:
@@ -520,6 +572,7 @@ class EUserv:
         self.orders_url = None
         self.last_page_state = "unknown"
         self.last_html = ""
+        self.used_pins: Set[str] = set()
 
     def _extract_orders_url(self, html: str, soup: Optional[BeautifulSoup] = None) -> Optional[str]:
         """Find a real orders page url from anchors, redirects or inline links."""
@@ -688,11 +741,13 @@ class EUserv:
             }
 
             logger.debug("提交登录表单...")
+            login_pin_requested_after = _utc_now() - timedelta(seconds=PIN_LOOKBACK_SECONDS)
             response = self.session.post(url, headers=headers, data=login_data)
             response.raise_for_status()
 
             # 解析返回页面
             soup = self._track_response(response, "login_submit")
+            sess_id = self.sess_id or sess_id
 
             # 检查登录错误
             if 'Please check email address/customer ID and password' in response.text:
@@ -720,13 +775,15 @@ class EUserv:
 
                     captcha_data = {
                         'subaction': 'login',
-                        'sess_id': sess_id,
+                        'sess_id': self.sess_id or sess_id,
                         'captcha_code': captcha_code
                     }
 
+                    login_pin_requested_after = _utc_now() - timedelta(seconds=PIN_LOOKBACK_SECONDS)
                     response = self.session.post(url, headers=headers, data=captcha_data)
                     response.raise_for_status()
                     soup = self._track_response(response, f"captcha_{captcha_attempt + 1}")
+                    sess_id = self.sess_id or sess_id
 
                     if 'captcha' in response.text.lower():
                         logger.warning(f"❌ 验证码错误（第 {captcha_attempt + 1} 次）")
@@ -762,17 +819,20 @@ class EUserv:
                 pin = get_euserv_pin(
                     self.config.email_pin,
                     self.config.email_password,
-                    self.config.imap_server
+                    self.config.imap_server,
+                    requested_after=login_pin_requested_after,
+                    exclude_pins=self.used_pins,
                 )
 
                 if not pin:
                     logger.error("❌ 获取 PIN 码失败")
                     return False
+                self.used_pins.add(pin)
 
                 login_confirm_data = {
                     'pin': pin,
                     'save_for_auto_login': 'on',
-                    'sess_id': sess_id,
+                    'sess_id': self.sess_id or sess_id,
                     'Submit': 'Confirm',
                     'subaction': 'login',
                     'c_id': pin_c_id,
@@ -780,6 +840,7 @@ class EUserv:
                 response = self.session.post(url, headers=headers, data=login_confirm_data)
                 response.raise_for_status()
                 soup = self._track_response(response, "login_pin_confirm")
+                sess_id = self.sess_id or sess_id
 
                 logger.info("✅ PIN 验证完成")
 
@@ -1027,15 +1088,15 @@ class EUserv:
                         logger.warning("⚠️ EUserv 返回限制页面，此次继续尝试其他入口")
                         continue
 
-                    if self.last_page_state == "login_page":
-                        logger.warning("⚠️ 检测到登录页，会话可能已失效")
-                        session_expired = True
-                        break
-
                     servers = self._parse_servers_from_soup(soup)
                     if servers:
                         logger.info(f"✅ 账号 {self.config.email} 找到 {len(servers)} 台服务器")
                         return servers
+
+                    if self.last_page_state == "login_page":
+                        logger.warning("⚠️ 检测到登录页，会话可能已失效")
+                        session_expired = True
+                        break
 
                     if self.last_page_state.startswith("orders"):
                         page_had_orders_markup = True
@@ -1107,6 +1168,7 @@ class EUserv:
                 'prefix': 'kc2_customer_contract_details_extend_contract_',
                 'type': '1'
             }
+            renew_pin_requested_after = _utc_now() - timedelta(seconds=PIN_LOOKBACK_SECONDS)
             resp2 = self.session.post(url, headers=headers, data=data)
             resp2.raise_for_status()
             # 检查PIN发送响应
@@ -1114,41 +1176,64 @@ class EUserv:
                 logger.error("❌ PIN发送请求失败")
                 return False
             
-            # 步骤3: 获取 PIN
+            # 步骤3/4: 获取 PIN 并验证获取 token。邮箱可能延迟投递，需跳过登录阶段旧 PIN。
             logger.debug("步骤3: 等待并获取 PIN 码...")
-            time.sleep(8)
-            pin = get_euserv_pin(
-                self.config.email_pin,
-                self.config.email_password,
-                self.config.imap_server
-            )
-            
-            if not pin:
-                logger.error(f"❌ 获取续期 PIN 码失败")
-                return False
-        
-            # 步骤4: 验证 PIN 获取 token
-            logger.debug("步骤4: 验证 PIN 获取 token...")
-            data = {
-                'sess_id': self.sess_id,
-                'auth': pin,
-                'subaction': 'kc2_security_password_get_token',
-                'prefix': 'kc2_customer_contract_details_extend_contract_',
-                'type': '1',
-                'ident': 'kc2_customer_contract_details_extend_contract_' + order_id
-            }
-            
-            resp3 = self.session.post(url, headers=headers, data=data)
-            resp3.raise_for_status()
+            token = None
+            failed_pins: Set[str] = set()
+            max_pin_attempts = 3
+            for pin_attempt in range(max_pin_attempts):
+                if pin_attempt > 0:
+                    logger.warning(f"⚠️ 续期 PIN 校验失败，等待新的 PIN 后重试 ({pin_attempt + 1}/{max_pin_attempts})")
 
-            result = json.loads(resp3.text)
-            if result.get('rs') != 'success':
+                exclude_pins = set(self.used_pins) | failed_pins
+                pin = get_euserv_pin(
+                    self.config.email_pin,
+                    self.config.email_password,
+                    self.config.imap_server,
+                    requested_after=renew_pin_requested_after,
+                    exclude_pins=exclude_pins,
+                    timeout=PIN_FETCH_TIMEOUT,
+                )
+
+                if not pin:
+                    logger.error("❌ 获取续期 PIN 码失败")
+                    return False
+                self.used_pins.add(pin)
+
+                # 步骤4: 验证 PIN 获取 token
+                logger.debug("步骤4: 验证 PIN 获取 token...")
+                data = {
+                    'sess_id': self.sess_id,
+                    'auth': pin,
+                    'subaction': 'kc2_security_password_get_token',
+                    'prefix': 'kc2_customer_contract_details_extend_contract_',
+                    'type': '1',
+                    'ident': 'kc2_customer_contract_details_extend_contract_' + order_id
+                }
+
+                resp3 = self.session.post(url, headers=headers, data=data)
+                resp3.raise_for_status()
+
+                result = json.loads(resp3.text)
+                if result.get('rs') == 'success':
+                    token = result['token']['value']
+                    break
+
+                result_text = " ".join(str(result.get(key, "")) for key in ("rs", "error"))
+                failed_pins.add(pin)
+                if "pin is invalid" in result_text.lower() and pin_attempt < max_pin_attempts - 1:
+                    logger.warning(f"⚠️ 获取 token 失败，疑似旧 PIN: {result.get('rs', 'unknown')}")
+                    continue
+
                 logger.error(f"❌ 获取 token 失败: {result.get('rs', 'unknown')}")
                 if 'error' in result:
                     logger.error(f"错误信息: {result['error']}")
                 return False
-            
-            token = result['token']['value']
+
+            if not token:
+                logger.error("❌ 多次尝试后仍未获取到续期 token")
+                return False
+
             logger.debug(f"✅ 获取到 token: {token[:20]}...")
             time.sleep(2)
 
