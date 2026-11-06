@@ -102,6 +102,39 @@ def detect_page_state(html: str) -> str:
     return "unknown"
 
 
+def response_diagnostics(response: requests.Response) -> str:
+    """Summarize an unexpected response without logging its potentially sensitive body."""
+    body = response.text or ""
+    content_type = response.headers.get("Content-Type", "missing").split(";", 1)[0].strip()
+    stripped = body.lstrip()
+    if not stripped:
+        body_kind = "empty"
+    elif stripped[0] in "[{":
+        body_kind = "json-like"
+    elif stripped[0] == "<":
+        body_kind = "html-like"
+    else:
+        body_kind = "text-like"
+
+    lower = body.lower()
+    signals = [
+        label for label, markers in (
+            ("login", ("name=\"password\"", "name='password'", "login")),
+            ("pin", ("name=\"pin\"", "name=\"auth\"", "pin that you receive")),
+            ("captcha", ("captcha", "securimage")),
+            ("access_denied", ("access denied", "forbidden")),
+            ("rate_limit", ("rate limit", "too many requests")),
+            ("cloudflare", ("cloudflare", "cf-ray")),
+        )
+        if any(marker in lower for marker in markers)
+    ]
+    signal_text = ",".join(signals) if signals else "none"
+    return (
+        f"HTTP {response.status_code}, Content-Type={content_type}, "
+        f"body={body_kind}/{len(body)} chars, signals={signal_text}"
+    )
+
+
 def dump_debug_html(prefix: str, html: str) -> Optional[str]:
     """Persist debug html so GitHub Actions artifacts can capture the real page."""
     if not html:
@@ -1212,11 +1245,28 @@ class EUserv:
                 }
 
                 resp3 = self.session.post(url, headers=headers, data=data)
+                if resp3.status_code >= 400:
+                    logger.error("续期 PIN 验证接口返回异常响应: %s", response_diagnostics(resp3))
+                    return False
                 resp3.raise_for_status()
 
-                result = json.loads(resp3.text)
+                try:
+                    result = resp3.json()
+                except (requests.exceptions.JSONDecodeError, json.JSONDecodeError):
+                    logger.error("续期 PIN 验证接口未返回有效 JSON: %s", response_diagnostics(resp3))
+                    return False
+                if not isinstance(result, dict):
+                    logger.error(
+                        "续期 PIN 验证接口返回了非对象 JSON: %s",
+                        response_diagnostics(resp3),
+                    )
+                    return False
                 if result.get('rs') == 'success':
-                    token = result['token']['value']
+                    token_data = result.get('token')
+                    token = token_data.get('value') if isinstance(token_data, dict) else None
+                    if not isinstance(token, str) or not token.strip():
+                        logger.error("续期 PIN 验证响应缺少 token.value")
+                        return False
                     break
 
                 result_text = " ".join(str(result.get(key, "")) for key in ("rs", "error"))
@@ -1234,7 +1284,7 @@ class EUserv:
                 logger.error("❌ 多次尝试后仍未获取到续期 token")
                 return False
 
-            logger.debug(f"✅ 获取到 token: {token[:20]}...")
+            logger.debug("✅ 已获取续期 token")
             time.sleep(2)
 
             # 步骤4.5: 弹出小窗
@@ -1654,14 +1704,21 @@ def main_v2():
         logger.error("No accounts configured")
         sys.exit(1)
 
+    eligible_accounts = [
+        account for account in ACCOUNTS
+        if account.email and str(account.email).strip()
+        and account.password and str(account.password).strip()
+        and account.email_password and str(account.email_password).strip()
+    ]
+    if not eligible_accounts:
+        logger.error("No complete account configuration is available")
+        sys.exit(1)
+
     all_results = []
     with ThreadPoolExecutor(max_workers=GLOBAL_CONFIG.max_workers) as executor:
         future_to_account = {
             executor.submit(process_account, account, GLOBAL_CONFIG): account
-            for account in ACCOUNTS
-            if account.email and str(account.email).strip()
-            and account.password and str(account.password).strip()
-            and account.email_password and str(account.email_password).strip()
+            for account in eligible_accounts
         }
 
         for future in as_completed(future_to_account):
@@ -1685,12 +1742,19 @@ def main_v2():
     logger.info("=" * 60)
 
     account_notifications = []
+    run_failed = False
     for result in all_results:
         email = result.get('email', '')
         servers = result.get('servers', {})
         renew_results = result.get('renew_results', [])
         error_type = result.get('error_type')
         error_msg = result.get('error')
+        account_failed = (
+            not result.get('success')
+            or bool(error_type)
+            or any(not renewal.get('success') for renewal in renew_results)
+        )
+        run_failed = run_failed or account_failed
 
         logger.info(f"\nAccount: {email}")
 
@@ -1731,7 +1795,7 @@ def main_v2():
     logger.info("\n" + "=" * 60)
     logger.info("Execution finished")
     logger.info("=" * 60)
-    os._exit(0)
+    sys.exit(1 if run_failed else 0)
 
 
 if __name__ == "__main__":
